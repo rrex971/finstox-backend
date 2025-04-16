@@ -1,0 +1,8 @@
+fastapi==0.115.12
+nsepython==2.94
+pandas==2.2.3
+passlib==1.7.4
+python-dotenv==1.1.0
+python_jose==3.4.0
+Requests==2.32.3
+yfinance==0.2.55
