@@ -1,7 +1,7 @@
 import json
 import nsepython as nse
 import pandas as pd
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from typing import Annotated
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -369,3 +369,178 @@ async def getQtyOwned(username: str, symbol: str):
     except Exception as e:
         print(f"Error in getQtyOwned for user {username}, symbol {symbol}: {e}")
         return JSONResponse(status_code=500, content={"detail": "Internal server error fetching quantity"})
+
+
+# transaction endpoints
+
+@app.post("/buy")
+async def buy(data: dict):
+
+
+    username = data.get("username")
+    symbol = data.get("symbol")
+    quantity_raw = data.get("quantity")
+
+    if not all([username, symbol, quantity_raw is not None]):
+        raise HTTPException(status_code=400, detail="Missing required fields: username, symbol, quantity")
+
+    try:
+        quantity = int(quantity_raw)
+        if quantity <= 0:
+            raise ValueError 
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Quantity must be a positive integer")
+
+
+    stock_data = await run_nse_in_executor(nse.nse_eq, symbol)
+    if not stock_data or "priceInfo" not in stock_data or "lastPrice" not in stock_data["priceInfo"]:
+         raise HTTPException(status_code=404, detail=f"Could not retrieve valid price for symbol {symbol}")
+
+    transaction_price = float(stock_data["priceInfo"]["lastPrice"])
+
+
+    total_cost = transaction_price * quantity
+
+    try:
+
+        cur.execute("SELECT userid FROM users WHERE username = ?", (username,))
+        user_result = cur.fetchone()
+        if not user_result:
+            raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+        user_id = user_result[0]
+
+        cur.execute("SELECT balance FROM wallet WHERE userid = ?", (user_id,))
+        wallet_result = cur.fetchone()
+        if not wallet_result:
+             raise HTTPException(status_code=500, detail=f"Wallet data inconsistency for user '{username}'")
+        user_balance = wallet_result[0]
+
+        if user_balance < total_cost:
+            raise HTTPException(status_code=400, detail=f"Insufficient funds. Required: {total_cost:.2f}, Available: {user_balance:.2f}")
+
+        cur.execute("UPDATE wallet SET balance = balance - ? WHERE userid = ?", (total_cost, user_id))
+
+        cur.execute("SELECT quantity, price FROM holdings WHERE userid = ? AND symbol = ?", (user_id, symbol))
+        existing_holding = cur.fetchone()
+
+        if existing_holding:
+            old_quantity = existing_holding[0]
+            old_avg_price = existing_holding[1]
+            new_total_quantity = old_quantity + quantity
+            new_avg_price = ((old_quantity * old_avg_price) + (quantity * transaction_price)) / new_total_quantity
+
+            cur.execute("""
+                UPDATE holdings
+                SET quantity = ?, price = ?
+                WHERE userid = ? AND symbol = ?
+            """, (new_total_quantity, new_avg_price, user_id, symbol))
+            if cur.rowcount == 0:
+                raise Exception("Failed to update existing holding during transaction.")
+        else:
+            cur.execute("""
+                INSERT INTO holdings (userid, symbol, quantity, price)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, symbol, quantity, transaction_price))
+
+        cur.execute("""
+            INSERT INTO orders (userid, symbol, quantity, type, price)
+            VALUES (?, ?, ?, 'BUY', ?)
+        """, (user_id, symbol, quantity, transaction_price))
+
+        conn.commit() 
+
+        return {"detail": f"Successfully bought {quantity} shares of {symbol} at {transaction_price:.2f} each. Total cost: {total_cost:.2f}"}
+
+    except HTTPException as http_exc:
+        conn.rollback()
+        raise http_exc
+    except Exception as e:
+        print(f"Transaction Error during buy for user {username}, symbol {symbol}: {e}")
+        conn.rollback() 
+        raise HTTPException(status_code=500, detail=f"Transaction failed due to server error: {e}")
+
+@app.post("/sell")
+async def sell(data: dict):
+
+    username = data.get("username")
+    symbol = data.get("symbol")
+    quantity_raw = data.get("quantity")
+
+    if not all([username, symbol, quantity_raw is not None]):
+        raise HTTPException(status_code=400, detail="Missing required fields: username, symbol, quantity")
+
+    try:
+        quantity = int(quantity_raw)
+        if quantity <= 0:
+            raise ValueError 
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Quantity must be a positive integer")
+
+
+    stock_data = await run_nse_in_executor(nse.nse_eq, symbol)
+    if not stock_data or "priceInfo" not in stock_data or "lastPrice" not in stock_data["priceInfo"]:
+         raise HTTPException(status_code=404, detail=f"Could not retrieve valid price for symbol {symbol}")
+
+    transaction_price = float(stock_data["priceInfo"]["lastPrice"])
+
+
+    total_revenue = transaction_price * quantity
+
+    try:
+
+        cur.execute("SELECT userid FROM users WHERE username = ?", (username,))
+        user_result = cur.fetchone()
+        if not user_result:
+            raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+        user_id = user_result[0]
+
+        cur.execute("SELECT balance FROM wallet WHERE userid = ?", (user_id,))
+        wallet_result = cur.fetchone()
+        if not wallet_result:
+             raise HTTPException(status_code=500, detail=f"Wallet data inconsistency for user '{username}'")
+        user_balance = wallet_result[0]
+
+        cur.execute("SELECT quantity, price FROM holdings WHERE userid = ? AND symbol = ?", (user_id, symbol))
+        existing_holding = cur.fetchone()
+
+        if not existing_holding:
+            raise HTTPException(status_code=400, detail=f"You don't have any {symbol} shares to sell")
+
+        old_quantity = existing_holding[0]
+        old_avg_price = existing_holding[1]
+
+        if old_quantity < quantity:
+            raise HTTPException(status_code=400, detail=f"You don't have enough {symbol} shares to sell")
+
+        new_quantity = old_quantity - quantity
+        new_avg_price = old_avg_price
+
+        if new_quantity == 0:
+            cur.execute("DELETE FROM holdings WHERE userid = ? AND symbol = ?", (user_id, symbol))
+        else:
+            cur.execute("""
+                UPDATE holdings
+                SET quantity = ?, price = ?
+                WHERE userid = ? AND symbol = ?
+            """, (new_quantity, new_avg_price, user_id, symbol))
+        if cur.rowcount == 0:
+            raise Exception("Failed to update existing holding during transaction.")
+
+        cur.execute("UPDATE wallet SET balance = balance + ? WHERE userid = ?", (total_revenue, user_id))
+
+        cur.execute("""
+            INSERT INTO orders (userid, symbol, quantity, type, price)
+            VALUES (?, ?, ?, 'SELL', ?)
+        """, (user_id, symbol, quantity, transaction_price))
+
+        conn.commit() 
+
+        return {"detail": f"Successfully sold {quantity} shares of {symbol} at {transaction_price:.2f} each. Total revenue: {total_revenue:.2f}"}
+
+    except HTTPException as http_exc:
+        conn.rollback()
+        raise http_exc
+    except Exception as e:
+        print(f"Transaction Error during sell for user {username}, symbol {symbol}: {e}")
+        conn.rollback() 
+        raise HTTPException(status_code=500, detail=f"Transaction failed due to server error: {e}")
