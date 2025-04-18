@@ -170,10 +170,11 @@ async def getHoldings(username: str):
         "changePercent": abs(round((float(stock["priceInfo"]["lastPrice"]) * holding[1] - totalbuy) / totalbuy * 100, 2)),
         "positive": float(stock["priceInfo"]["lastPrice"]) * holding[1] - totalbuy > 0,
         })
-
-    holdingsData["total"]["totalChange"] = abs(holdingsData["total"]["totalCurrent"] - holdingsData["total"]["totalInvested"])
-    holdingsData["total"]["totalChangePercent"] = abs(round((holdingsData["total"]["totalCurrent"] - holdingsData["total"]["totalInvested"]) / holdingsData["total"]["totalInvested"] * 100, 2))
-    holdingsData["total"]["positive"] = holdingsData["total"]["totalCurrent"] - holdingsData["total"]["totalInvested"] > 0
+    
+    if holdingsData["total"]["totalInvested"] != 0:
+        holdingsData["total"]["totalChange"] = abs(holdingsData["total"]["totalCurrent"] - holdingsData["total"]["totalInvested"])
+        holdingsData["total"]["totalChangePercent"] = abs(round((holdingsData["total"]["totalCurrent"] - holdingsData["total"]["totalInvested"]) / holdingsData["total"]["totalInvested"] * 100, 2))
+        holdingsData["total"]["positive"] = holdingsData["total"]["totalCurrent"] - holdingsData["total"]["totalInvested"] > 0
     return holdingsData
     
     
