@@ -12,12 +12,13 @@ import os
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import csv
 from util.dbsetup import load_db
 from util.auth import *
-
+from util.model import get_stock_predictions
 import asyncio
+import logging
 
 cur, conn = load_db()
 nse_symbols = nse.nse_eq_symbols()
@@ -39,6 +40,7 @@ app.add_middleware(
 
 
 app.mount("/logos", StaticFiles(directory="logos"), name="logos")
+app.mount("/predictions", StaticFiles(directory="predictions"), name="predictions")
 
 @app.get("/")
 async def root():
@@ -544,3 +546,47 @@ async def sell(data: dict):
         print(f"Transaction Error during sell for user {username}, symbol {symbol}: {e}")
         conn.rollback() 
         raise HTTPException(status_code=500, detail=f"Transaction failed due to server error: {e}")
+
+
+prediction_cache = {}
+
+@app.get("/predict/{symbol}")
+async def predict_stock(symbol: str):
+    symbol = symbol.strip().upper()
+    today = date.today()
+    logging.info(f"Received prediction request for: {symbol}")
+
+    cached_result = prediction_cache.get(symbol)
+    if cached_result:
+        generation_date = cached_result.get("generation_date")
+        if generation_date == today:
+            logging.info(f"Cache hit for {symbol} generated on {today.isoformat()}. Returning cached data.")
+            return cached_result["data"]
+        else:
+            logging.info(f"Cache exists for {symbol} but is stale (generated on {generation_date.isoformat()}). Will regenerate.")
+    else:
+        logging.info(f"Cache miss for {symbol}. Generating new prediction.")
+
+    results = get_stock_predictions(symbol, days_to_predict=7)
+
+    if results and 'predictions' in results and 'last_date' in results and 'filename' in results:
+        logging.info(f"Successfully generated new prediction for {symbol}.")
+
+        last_date_str = results['last_date'].strftime('%Y-%m-%d')
+        api_response_data = {
+            "symbol": symbol,
+            "last_historical_date": last_date_str,
+            "predicted_prices": results['predictions'],
+            "filename": results['filename']
+        }
+
+        prediction_cache[symbol] = {
+            "generation_date": today,
+            "data": api_response_data 
+        }
+        logging.info(f"Stored prediction for {symbol} in cache for {today.isoformat()}.")
+
+        return api_response_data
+    else:
+        logging.error(f"Prediction generation failed for symbol {symbol}.")
+        raise HTTPException(status_code=500, detail=f"Failed to generate prediction for {symbol}")
