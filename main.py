@@ -584,6 +584,92 @@ async def sell(data: dict):
 
 prediction_cache = {}
 
+# Sector indices for explore page
+SECTOR_INDICES = {
+    "NIFTY BANK": "Banking",
+    "NIFTY IT": "IT",
+    "NIFTY PHARMA": "Pharma",
+    "NIFTY AUTO": "Auto",
+    "NIFTY FMCG": "FMCG",
+    "NIFTY ENERGY": "Energy",
+    "NIFTY METAL": "Metal",
+}
+
+def _parse_index_stocks(data, limit=10):
+    """Parse stock data from NSE index API response."""
+    stocks = []
+    if not data or 'data' not in data:
+        return stocks
+    for item in data['data'][1:limit+1]:  # skip first row (index itself)
+        try:
+            stocks.append({
+                "name": item.get("identifier", item.get("symbol", "")),
+                "symbol": item["symbol"],
+                "price": item["lastPrice"],
+                "onedaychange": round(abs(float(item["change"])), 2),
+                "onedaychangepercent": round(abs(float(item["pChange"])), 2),
+                "positive": float(item["pChange"]) > 0,
+                "volume": item.get("totalTradedVolume", 0),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return stocks
+
+@app.get("/getSectorStocks")
+async def getSectorStocks(sector: str):
+    if sector not in SECTOR_INDICES:
+        return JSONResponse(status_code=400, content={"detail": f"Unknown sector. Available: {list(SECTOR_INDICES.keys())}"})
+    url = f"https://www.nseindia.com/api/equity-stockIndices?index={urllib.parse.quote(sector)}"
+    data = await run_nse_in_executor(_nsefetch_curl, url)
+    stocks = _parse_index_stocks(data)
+    return {"sector": sector, "label": SECTOR_INDICES[sector], "stocks": stocks}
+
+@app.get("/getAllSectors")
+async def getAllSectors():
+    return {"sectors": [{"index": k, "label": v} for k, v in SECTOR_INDICES.items()]}
+
+@app.get("/getMostActive")
+async def getMostActive():
+    url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
+    data = await run_nse_in_executor(_nsefetch_curl, url)
+    if not data or 'data' not in data:
+        return []
+    stocks = []
+    for item in data['data'][1:]:  # skip index row
+        try:
+            stocks.append({
+                "name": item.get("identifier", item.get("symbol", "")),
+                "symbol": item["symbol"],
+                "price": item["lastPrice"],
+                "onedaychange": round(abs(float(item["change"])), 2),
+                "onedaychangepercent": round(abs(float(item["pChange"])), 2),
+                "positive": float(item["pChange"]) > 0,
+                "volume": item.get("totalTradedVolume", 0),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    stocks.sort(key=lambda x: x.get("volume", 0), reverse=True)
+    return stocks[:10]
+
+@app.get("/getMarketOverview")
+async def getMarketOverview():
+    indices = ["NIFTY 50", "NIFTY BANK", "NIFTY IT"]
+    overview = []
+    for idx in indices:
+        try:
+            info = await run_nse_in_executor(nse.nse_get_index_quote, idx)
+            if info and isinstance(info, dict):
+                overview.append({
+                    "name": idx,
+                    "last": info.get("last", 0),
+                    "change": round(float(info.get("last", 0)) - float(info.get("previousClose", 0)), 2),
+                    "pChange": round(float(info.get("percChange", 0)), 2),
+                    "positive": float(info.get("percChange", 0)) > 0,
+                })
+        except Exception as e:
+            print(f"Error fetching {idx}: {e}")
+    return overview
+
 @app.get("/predict/{symbol}")
 async def predict_stock(symbol: str):
     symbol = symbol.strip().upper()
