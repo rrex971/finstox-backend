@@ -1,3 +1,7 @@
+import os
+# compatibility workaround for windows dev
+# os.environ["COMPLUS_Version"] = "v4.0.30319"
+
 import json
 import nsepython as nse
 import pandas as pd
@@ -577,7 +581,9 @@ async def predict_stock(symbol: str):
             "symbol": symbol,
             "last_historical_date": last_date_str,
             "predicted_prices": results['predictions'],
-            "filename": results['filename']
+            "filename": results['filename'],
+            "shap_values": results.get('shap_values'),
+            "lime_weights": results.get('lime_weights')
         }
 
         prediction_cache[symbol] = {

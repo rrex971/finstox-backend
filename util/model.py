@@ -1,334 +1,334 @@
 import requests
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
-import nsepython as nse # Import nsepython
+import nsepython as nse 
 import os
-from datetime import date, timedelta, datetime # Import date utilities
+from datetime import date, timedelta, datetime
+import ta
+import shap
+import lime
+import lime.lime_tabular
 
-# Removed Marketstack API key
 
-# Step 1: Fetch stock data from NSEPython
+# fetch historical stock data via yfinance
 def fetch_data_nsepython(symbol, days_history=250):
-    """Fetches historical equity data using nsepython."""
-    print(f"\n📥 Fetching stock data for {symbol} from NSEPython...")
+    print(f"> fetching data for {symbol}...")
+    
+    import yfinance as yf
+    
+    yf_symbol = symbol if symbol.endswith('.NS') else symbol + '.NS'
+    try:
+        end_dt = date.today()
+        start_dt = end_dt - timedelta(days=int(days_history * 1.5))
+        
+        df = yf.download(yf_symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'), progress=False)
+        
+        if df.empty:
+             print(f"> no data for {yf_symbol}, trying without .NS suffix...")
+             df = yf.download(symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'), progress=False)
+        
+        if df.empty:
+            raise ValueError("No data returned from yfinance.")
+            
+        df = df.reset_index()
+        
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[0] for col in df.columns]
 
-    # Calculate start and end dates
-    end_dt = date.today()
-    # Go back enough days to likely get ~500 trading days
-    start_dt = end_dt - timedelta(days=days_history)
-
-    # Format dates as DD-MM-YYYY for nsepython
-    start_date_str = start_dt.strftime("%d-%m-%Y")
-    end_date_str = end_dt.strftime("%d-%m-%Y")
-    print(f"📅 Requesting data from {start_date_str} to {end_date_str}")
+        rename_map = {
+            'Date': 'date', 
+            'Close': 'close',
+            'Volume': 'volume',
+            'High': 'high',
+            'Low': 'low'
+        }
+        df.rename(columns=rename_map, inplace=True)
+        df.columns = [str(c).lower() if str(c).lower() in rename_map.values() else c for c in df.columns]
+        
+    except Exception as e:
+        print(f"> yfinance failed: {e}")
+        return None
 
     try:
-        # Fetch data using nsepython
-        df = nse.equity_history(symbol=symbol, series="EQ", start_date=start_date_str, end_date=end_date_str)
-
-        if df is None or df.empty:
-            raise ValueError("No data returned from nsepython.")
-
-        # --- Data Cleaning and Selection ---
-        # Select relevant columns (adjust if column names differ slightly in future versions)
-        if 'CH_TIMESTAMP' not in df.columns or 'CH_CLOSING_PRICE' not in df.columns:
-             raise ValueError("Expected columns ('CH_TIMESTAMP', 'CH_CLOSING_PRICE') not found in the data.")
-
-        df_processed = df[['CH_TIMESTAMP', 'CH_CLOSING_PRICE']].copy()
-
-        # Rename columns for consistency
-        df_processed.rename(columns={'CH_TIMESTAMP': 'date', 'CH_CLOSING_PRICE': 'close'}, inplace=True)
-
-        # Convert 'date' column to datetime objects
+        required_cols = ['date', 'close', 'volume', 'high', 'low']
+        extract_cols = [c for c in required_cols if c in df.columns]
+        df_processed = df[extract_cols].copy()
+        
         df_processed['date'] = pd.to_datetime(df_processed['date'])
-
-        # Convert 'close' price to numeric, handling potential errors
+        
         df_processed['close'] = pd.to_numeric(df_processed['close'], errors='coerce')
-        df_processed.dropna(subset=['close'], inplace=True) # Remove rows where close price couldn't be converted
-
-        # Sort values by date in ascending order (important for time series)
+        df_processed.dropna(subset=['close'], inplace=True)
+        
         df_processed = df_processed.sort_values('date').reset_index(drop=True)
 
-        print(f"✅ Fetched and processed {len(df_processed)} records!\n")
+        # compute technical indicators
+        df_processed['SMA_5'] = ta.trend.sma_indicator(df_processed['close'], window=5)
+        df_processed['SMA_20'] = ta.trend.sma_indicator(df_processed['close'], window=20)
+        df_processed['RSI_14'] = ta.momentum.rsi(df_processed['close'], window=14)
+        df_processed['Volatility'] = df_processed['close'].rolling(window=14).std()
+        
+        if 'volume' not in df_processed.columns:
+            df_processed['volume'] = 0
+            
+        df_processed.dropna(inplace=True)
+        df_processed = df_processed.reset_index(drop=True)
+
+        print(f"> processed {len(df_processed)} records")
         return df_processed
 
     except Exception as e:
-        print(f"🚨 Error fetching or processing data from nsepython: {e}")
+        print(f"> error processing data: {e}")
         return None
 
-# Step 2: Preprocess data (No changes needed)
-def preprocess_data(data, n_steps=60):
-    print("🧪 Preprocessing data...")
-    close_prices = data['close'].values.reshape(-1, 1)
 
-    # Check if close_prices has enough data
-    if len(close_prices) <= n_steps:
-        print(f"🚨 Error: Not enough data ({len(close_prices)} points) to create sequences with n_steps={n_steps}")
-        return None, None, None, None # Return None values to indicate failure
+# preprocess data into sequences for lstm
+def preprocess_data(data, n_steps=60):
+    print("> preprocessing data...")
+
+    # close must be first (index 0) for target extraction
+    feature_columns = ['close', 'volume', 'SMA_5', 'SMA_20', 'RSI_14', 'Volatility']
+
+    for col in feature_columns:
+        if col not in data.columns:
+            data[col] = 0
+
+    features_data = data[feature_columns].values
+
+    if len(features_data) <= n_steps:
+        print(f"> not enough data ({len(features_data)} points) for n_steps={n_steps}")
+        return None, None, None, None, None
 
     scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(close_prices)
+    scaled = scaler.fit_transform(features_data)
 
     X, y = [], []
     for i in range(n_steps, len(scaled)):
-        X.append(scaled[i - n_steps:i, 0])
+        X.append(scaled[i - n_steps:i, :])
         y.append(scaled[i, 0])
 
-    # Check if X and y were populated
     if not X or not y:
-         print(f"🚨 Error: Could not create sequences. Check data length and n_steps.")
-         return None, None, None, None
+         print("> could not create sequences")
+         return None, None, None, None, None
 
     X = np.array(X)
     y = np.array(y)
-    X = X.reshape((X.shape[0], X.shape[1], 1))
-    print(f"📊 Shape of X: {X.shape}, y: {y.shape}")
-    return X, y, scaler, scaled
+    print(f"> X: {X.shape}, y: {y.shape}")
+    return X, y, scaler, scaled, feature_columns
 
-# Step 3: Build model (No changes needed)
+
+# build lstm model
 def build_model(input_shape):
-    print("\n🧠 Building model...")
+    print(f"> building model, input_shape={input_shape}")
     model = Sequential()
     model.add(LSTM(50, return_sequences=True, input_shape=input_shape))
     model.add(LSTM(50))
     model.add(Dense(25))
     model.add(Dense(1))
     model.compile(optimizer='adam', loss='mean_squared_error')
-    print("✅ Model ready!\n")
     return model
 
-# Step 4: Predict next 7 days (No changes needed)
+
+# predict next n days using sliding window
 def predict_next_days(model, scaled_data, scaler, n_steps=60, days=7):
-    print(f"📈 Predicting next {days} days...")
+    print(f"> predicting next {days} days...")
     if len(scaled_data) < n_steps:
-         print(f"🚨 Error: Not enough historical data ({len(scaled_data)}) in scaled_data to make prediction with n_steps={n_steps}")
+         print(f"> not enough data ({len(scaled_data)}) for prediction")
          return None
 
     input_seq = scaled_data[-n_steps:]
     predictions = []
+    num_features = input_seq.shape[1]
 
     for _ in range(days):
-        if input_seq.shape != (n_steps, 1): # Add safety check
-             input_seq = input_seq.reshape(n_steps, 1)
+        input_reshaped = input_seq.reshape(1, n_steps, num_features)
+        pred_scaled = model.predict(input_reshaped, verbose=0)[0, 0]
 
-        input_reshaped = input_seq.reshape(1, n_steps, 1)
-        pred = model.predict(input_reshaped, verbose=0)[0, 0]
-        predictions.append(pred)
-        # Update the input sequence for the next prediction
-        input_seq = np.append(input_seq[1:], [[pred]], axis=0) # Correct way to append for shape (n_steps, 1)
+        # copy last row, update close price (index 0), slide window
+        new_row = np.copy(input_seq[-1])
+        new_row[0] = pred_scaled
+        predictions.append(pred_scaled)
+        input_seq = np.append(input_seq[1:], [new_row], axis=0)
 
-    # Check if predictions were generated
     if not predictions:
-         print("🚨 Error: No predictions were generated.")
          return None
 
-    predictions_array = np.array(predictions).reshape(-1, 1)
-    # Inverse transform predictions
+    # inverse transform needs full feature width; fill zeros for non-close columns
+    predictions_array = np.zeros((len(predictions), num_features))
+    predictions_array[:, 0] = predictions
+
     try:
-        inversed_predictions = scaler.inverse_transform(predictions_array)
-        return inversed_predictions
+        inversed = scaler.inverse_transform(predictions_array)
+        return inversed[:, 0].reshape(-1, 1)
     except Exception as e:
-        print(f"🚨 Error during inverse transform: {e}")
+        print(f"> inverse transform error: {e}")
         return None
 
 
-# Step 5: Plotting (No changes needed)
+# generate shap feature importance
+def generate_shap_values(model, X_train, target_instance, feature_columns):
+    print("> generating shap values...")
+    try:
+        background = X_train[-100:]
+        explainer = shap.GradientExplainer(model, background)
+        shap_values = explainer.shap_values(target_instance)
+
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+
+        # sum across time steps for per-feature importance
+        feature_importance = np.sum(shap_values[0], axis=0)
+        base_value = float(np.mean(model.predict(background, verbose=0)))
+
+        return {
+            "features": feature_columns,
+            "values": [float(v) for v in feature_importance],
+            "base_value": base_value
+        }
+    except Exception as e:
+        print(f"> shap error: {e}")
+        return None
+
+
+# generate lime explanation weights
+def generate_lime_weights(model, X_train, target_instance, feature_columns):
+    print("> generating lime weights...")
+    try:
+        n_steps = X_train.shape[1]
+        num_features = X_train.shape[2]
+
+        # lime needs 2d; average across time steps
+        background_2d = np.mean(X_train[-100:], axis=1)
+        target_2d = np.mean(target_instance, axis=1)[0]
+
+        explainer = lime.lime_tabular.LimeTabularExplainer(
+            background_2d,
+            feature_names=feature_columns,
+            class_names=['ClosePrice'],
+            mode='regression'
+        )
+
+        # wrapper: broadcast 2d back to 3d for lstm
+        def predict_fn_2d(X_2d):
+            X_3d = np.repeat(X_2d[:, np.newaxis, :], n_steps, axis=1)
+            return model.predict(X_3d, verbose=0).flatten()
+
+        exp = explainer.explain_instance(
+            target_2d,
+            predict_fn_2d,
+            num_features=len(feature_columns),
+            num_samples=150
+        )
+
+        # map lime output back to clean feature names
+        extracted_features = []
+        extracted_weights = []
+        for lime_str, weight in exp.as_list():
+            matched_feature = "Unknown"
+            for col in feature_columns:
+                if col in lime_str:
+                    matched_feature = col
+                    break
+            extracted_features.append(matched_feature)
+            extracted_weights.append(float(weight))
+
+        return {
+            "features": extracted_features,
+            "weights": extracted_weights,
+            "fidelity_score": float(exp.score)
+        }
+    except Exception as e:
+         print(f"> lime error: {e}")
+         return None
+
+
+# plotting disabled
 def plot_predictions(preds, last_date, symbol):
-    """
-    Generates and saves a dark-themed plot of stock predictions.
+    return "plot_disabled.png"
 
-    Args:
-        preds (list or np.array): List of predicted prices.
-        last_date (datetime or pd.Timestamp): The last date from historical data.
-        symbol (str): The stock symbol for the title and filename.
 
-    Returns:
-        str: The filename of the saved plot, or None if plotting fails.
-    """
-    try:
-        # --- Date Handling (Ensure last_date is usable) ---
-        if isinstance(last_date, datetime):
-            last_date = pd.Timestamp(last_date)
-        elif not isinstance(last_date, pd.Timestamp):
-            print(f"⚠️ Warning: last_date type ({type(last_date)}) might not be optimal for date_range. Converting.")
-            try:
-                last_date = pd.to_datetime(last_date)
-            except Exception as e:
-                print(f"🚨 Error converting last_date: {e}. Plotting failed.")
-                return None
 
-        # --- Generate Dates for X-axis ---
-        # Using Business Day frequency
-        dates = pd.date_range(start=last_date + timedelta(days=1), periods=len(preds), freq='B')
+# main prediction pipeline
+def get_stock_predictions(symbol: str, days_to_predict: int = 7, n_steps: int = 60, epochs: int = 15, days_history: int = 350):
+    print(f"> generating prediction for {symbol}")
+    symbol = symbol.strip().upper()
 
-        # --- Define Dark Theme Colors ---
-        dark_bg = '#1c1c1c'
-        light_fg = '#e0e0e0' # For text, ticks, main axes spines
-        grid_color = '#444444' # Subdued grid lines
-        line_color = '#29b6f6' # A bright cyan/light blue for the plot line
-        marker_color = '#fdd835' # A contrasting yellow for markers (optional)
-
-        # --- Create Plot using Object-Oriented Interface ---
-        fig, ax = plt.subplots(figsize=(12, 6)) # Create figure and axes object
-
-        # --- Apply Dark Theme Styles ---
-        fig.patch.set_facecolor(dark_bg)  # Set figure background color
-        ax.set_facecolor(dark_bg)        # Set axes background color
-
-        # Plot the prediction data
-        ax.plot(dates, preds,
-                marker='o',          # Add markers
-                markersize=5,        # Size of markers
-                markerfacecolor=marker_color, # Marker fill color
-                markeredgecolor=dark_bg,    # Marker edge color (match bg)
-                linestyle='-',       # Solid line
-                linewidth=1.5,       # Line width
-                color=line_color,    # Line color
-                label='Predicted Prices')
-
-        ax.spines['top'].set_color(grid_color)
-        ax.spines['right'].set_color(grid_color)
-        ax.spines['bottom'].set_color(light_fg) # Make bottom axis visible
-        ax.spines['left'].set_color(light_fg)   # Make left axis visible
-
-        ax.tick_params(axis='x', colors=light_fg, labelsize=10)
-        ax.tick_params(axis='y', colors=light_fg, labelsize=10)
-
-        ax.set_xlabel("Date", color=light_fg, fontsize=12)
-        ax.set_ylabel("Price (₹)", color=light_fg, fontsize=12) # Assuming Rupee
-
-        ax.grid(True, color=grid_color, linestyle='--', linewidth=0.5, alpha=0.7)
-
-        legend = ax.legend(facecolor='#2a2a2a', edgecolor=grid_color, fontsize=10, framealpha=0.8)
-        for text in legend.get_texts():
-            text.set_color(light_fg) 
-
-        fig.autofmt_xdate()
-
-        output_dir = "predictions"
-        os.makedirs(output_dir, exist_ok=True)
-
-        timestamp_str = datetime.now().strftime('%Y-%m-%d')
-        filename = os.path.join(output_dir, f"{symbol}_{timestamp_str}.png")
-
-        plt.savefig(
-            filename,
-            dpi=300,                     
-            bbox_inches='tight',         
-            facecolor=fig.get_facecolor() 
-            )
-        plt.close(fig)
-
-        print(f"📊 Saved dark theme plot to {filename}")
-        return filename
-
-    except Exception as e:
-        print(f"🚨 An error occurred during plotting: {e}")
-        try:
-            plt.close(fig)
-        except NameError:
-            pass
+    df = fetch_data_nsepython(symbol, days_history=days_history)
+    if df is None or df.empty:
+        print(f"> could not fetch data for {symbol}")
         return None
 
-
-
-def get_stock_predictions(symbol: str, days_to_predict: int = 7, n_steps: int = 60, epochs: int = 90, days_history: int = 750):
-
-    print(f"\n--- Generating prediction for {symbol} ---")
-    symbol = symbol.strip().upper() # Clean up symbol
-
-    # 1. Fetch Data
-    df = fetch_data_nsepython(symbol, days_history=days_history)
-
-    if df is None or df.empty:
-        print(f"❌ Could not fetch data for {symbol}.")
-        return None # Indicate failure
-
-    # Store last date before potentially failing preprocessing
     last_day = df['date'].max()
 
-    # 2. Preprocess Data
-    X, y, scaler, scaled_data = preprocess_data(df, n_steps=n_steps)
-
-    if X is None: # Check if preprocessing failed
-        print(f"❌ Preprocessing failed for {symbol}.")
-        return None # Indicate failure
-
-    # 3. Build Model
-    # Input shape depends on the actual preprocessed data shape
-    model = build_model((X.shape[1], 1))
-
-    # 4. Train Model
-    print(f"🧠 Training model for {symbol}...")
-    try:
-        # Consider adding validation data if possible for better training practices
-        model.fit(X, y, epochs=epochs, batch_size=64, verbose=0) # Set verbose=0 for backend use
-        print(f"✅ Training complete for {symbol}!")
-    except Exception as e:
-        print(f"🚨 Error during model training for {symbol}: {e}")
+    X, y, scaler, scaled_data, feature_columns = preprocess_data(df, n_steps=n_steps)
+    if X is None:
+        print(f"> preprocessing failed for {symbol}")
         return None
 
-    # 5. Predict Future Days
+    model = build_model((X.shape[1], X.shape[2]))
+
+    print(f"> training model for {symbol}...")
+    try:
+        model.fit(X, y, epochs=epochs, batch_size=64, verbose=0)
+        print(f"> training complete for {symbol}")
+    except Exception as e:
+        print(f"> training error for {symbol}: {e}")
+        return None
+
     predictions_raw = predict_next_days(model, scaled_data, scaler, n_steps, days=days_to_predict)
-
     if predictions_raw is None:
-        print(f"❌ Prediction failed for {symbol}.")
-        return None 
+        print(f"> prediction failed for {symbol}")
+        return None
+
     filename = plot_predictions(predictions_raw, last_day, symbol)
-
     predictions_list = [round(float(p[0]), 2) for p in predictions_raw]
+    print(f"> predictions for {symbol}: {predictions_list}")
 
-    print(f"✅ Predictions generated for {symbol}: {predictions_list}")
+    # xai explanations
+    target_instance = scaled_data[-n_steps:].reshape(1, n_steps, len(feature_columns))
+    shap_data = generate_shap_values(model, X, target_instance, feature_columns)
+    lime_data = generate_lime_weights(model, X, target_instance, feature_columns)
 
-    
     return {
         'predictions': predictions_list,
         'last_date': last_day,
-        'filename': f"{filename}"
+        'filename': f"{filename}",
+        'shap_values': shap_data,
+        'lime_weights': lime_data
     }
     
-# Main logic
 if __name__ == "__main__":
-    # Use upper() for consistency, strip whitespace
     symbol = input("Enter stock symbol (e.g., SBIN, RELIANCE, INFY): ").strip().upper()
-    # Note: For NSE stocks, sometimes ".NS" is needed for other APIs, but nsepython often handles the base symbol.
 
-    # Fetch data using the new function
-    # Request more history to account for non-trading days (e.g., 750 days to get ~500 trading days)
     df = fetch_data_nsepython(symbol, days_history=750)
 
     if df is not None and not df.empty:
         n_steps = 60
-        X, y, scaler, scaled_data = preprocess_data(df, n_steps=n_steps)
+        X, y, scaler, scaled_data, feature_columns = preprocess_data(df, n_steps=n_steps)
 
-        # Proceed only if preprocessing was successful
         if X is not None and y is not None and scaler is not None and scaled_data is not None:
-            model = build_model((X.shape[1], 1)) # input shape based on preprocessed X
+            model = build_model((X.shape[1], X.shape[2]))
 
-            print("🧠 Training model...")
-            # Consider adding validation_split or a separate validation set for better training
+            print("> training model...")
             model.fit(X, y, epochs=90, batch_size=64, verbose=1)
-            print("✅ Training complete!\n")
+            print("> training complete")
 
             predictions = predict_next_days(model, scaled_data, scaler, n_steps, days=7)
 
             if predictions is not None:
-                print("📤 Predicted prices for next 7 business days:")
+                print("> predicted prices for next 7 business days:")
                 for i, val in enumerate(predictions, 1):
-                    # Ensure val is indexable, handle potential shape issues
                     price = val[0] if isinstance(val, (list, np.ndarray)) and len(val) > 0 else val
-                    print(f"Day {i}: ₹{price:.2f}") # Using Rupee symbol for NSE
+                    print(f"  day {i}: {price:.2f}")
 
-                # Get the last date from the fetched data for plotting
                 last_day = df['date'].max()
                 plot_predictions(predictions, last_day)
             else:
-                print("❌ Prediction failed.")
+                print("> prediction failed")
         else:
-            print("❌ Preprocessing failed. Cannot train or predict.")
+            print("> preprocessing failed")
     else:
-        print(f"❌ Could not fetch data for {symbol}. Exiting.")
+        print(f"> could not fetch data for {symbol}")
