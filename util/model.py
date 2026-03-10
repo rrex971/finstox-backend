@@ -1,11 +1,10 @@
 import requests
 import pandas as pd
 import numpy as np
-# import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
-import nsepython as nse 
+import nsepython as nse
 import os
 from datetime import date, timedelta, datetime
 import ta
@@ -14,72 +13,125 @@ import lime
 import lime.lime_tabular
 
 
-# fetch historical stock data via yfinance
+def _fetch_nse(symbol, days_history):
+    end_dt = date.today()
+    start_dt = end_dt - timedelta(days=int(days_history * 1.5))
+    df = nse.equity_history(symbol, 'EQ', start_dt.strftime('%d-%m-%Y'), end_dt.strftime('%d-%m-%Y'))
+    if df is None or df.empty:
+        return None
+    nse_col_map = {
+        'CH_TIMESTAMP': 'date',
+        'CH_CLOSING_PRICE': 'close',
+        'CH_TRADE_HIGH_PRICE': 'high',
+        'CH_TRADE_LOW_PRICE': 'low',
+        'CH_TOTAL_TRADED_QUANTITY': 'volume',
+    }
+    df = df.rename(columns=nse_col_map)
+    return df
+
+
+def _fetch_yfinance(symbol, days_history):
+    import yfinance as yf
+    yf_symbol = symbol if symbol.endswith('.NS') else symbol + '.NS'
+    end_dt = date.today()
+    start_dt = end_dt - timedelta(days=int(days_history * 1.5))
+    df = yf.download(yf_symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'), progress=False)
+    if df.empty:
+        print(f"> no data for {yf_symbol}, trying without .NS suffix...")
+        df = yf.download(symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'), progress=False)
+    if df.empty:
+        # yfinance library may be rate-limited, try direct curl
+        print("> yfinance library returned empty, trying direct curl to yahoo api...")
+        df = _fetch_yahoo_curl(yf_symbol, days_history)
+    if df is None or df.empty:
+        return None
+    df = df.reset_index()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
+    rename_map = {'Date': 'date', 'Close': 'close', 'Volume': 'volume', 'High': 'high', 'Low': 'low'}
+    df.rename(columns=rename_map, inplace=True)
+    df.columns = [str(c).lower() if str(c).lower() in rename_map.values() else c for c in df.columns]
+    return df
+
+
+def _fetch_yahoo_curl(symbol, days_history):
+    import json as _json
+    import subprocess
+    period = '1y' if days_history <= 252 else '2y'
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={period}&interval=1d'
+    try:
+        raw = subprocess.check_output(
+            ['curl', '-s', '--max-time', '15', '-H', 'User-Agent: Mozilla/5.0', url],
+            stderr=subprocess.DEVNULL, timeout=20
+        ).decode()
+        data = _json.loads(raw)
+        result = data['chart']['result'][0]
+        timestamps = result['timestamp']
+        quote = result['indicators']['quote'][0]
+        df = pd.DataFrame({
+            'Date': pd.to_datetime(timestamps, unit='s').normalize(),
+            'Close': quote['close'],
+            'High': quote['high'],
+            'Low': quote['low'],
+            'Volume': quote['volume'],
+        })
+        df.dropna(subset=['Close'], inplace=True)
+        return df
+    except Exception as e:
+        print(f"> direct yahoo curl failed: {e}")
+        return None
+
+
+def _add_indicators(df):
+    required_cols = ['date', 'close', 'volume', 'high', 'low']
+    extract_cols = [c for c in required_cols if c in df.columns]
+    df_processed = df[extract_cols].copy()
+    df_processed['date'] = pd.to_datetime(df_processed['date'])
+    df_processed['close'] = pd.to_numeric(df_processed['close'], errors='coerce')
+    df_processed.dropna(subset=['close'], inplace=True)
+    df_processed = df_processed.sort_values('date').reset_index(drop=True)
+    df_processed['SMA_5'] = ta.trend.sma_indicator(df_processed['close'], window=5)
+    df_processed['SMA_20'] = ta.trend.sma_indicator(df_processed['close'], window=20)
+    df_processed['RSI_14'] = ta.momentum.rsi(df_processed['close'], window=14)
+    df_processed['Volatility'] = df_processed['close'].rolling(window=14).std()
+    if 'volume' not in df_processed.columns:
+        df_processed['volume'] = 0
+    df_processed.dropna(inplace=True)
+    df_processed = df_processed.reset_index(drop=True)
+    return df_processed
+
+
 def fetch_data_nsepython(symbol, days_history=250):
     print(f"> fetching data for {symbol}...")
-    
-    import yfinance as yf
-    
-    yf_symbol = symbol if symbol.endswith('.NS') else symbol + '.NS'
-    try:
-        end_dt = date.today()
-        start_dt = end_dt - timedelta(days=int(days_history * 1.5))
-        
-        df = yf.download(yf_symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'), progress=False)
-        
-        if df.empty:
-             print(f"> no data for {yf_symbol}, trying without .NS suffix...")
-             df = yf.download(symbol, start=start_dt.strftime('%Y-%m-%d'), end=end_dt.strftime('%Y-%m-%d'), progress=False)
-        
-        if df.empty:
-            raise ValueError("No data returned from yfinance.")
-            
-        df = df.reset_index()
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
+    df = None
 
-        rename_map = {
-            'Date': 'date', 
-            'Close': 'close',
-            'Volume': 'volume',
-            'High': 'high',
-            'Low': 'low'
-        }
-        df.rename(columns=rename_map, inplace=True)
-        df.columns = [str(c).lower() if str(c).lower() in rename_map.values() else c for c in df.columns]
-        
+    # yfinance primary (nse historical api has strict bot detection)
+    try:
+        df = _fetch_yfinance(symbol, days_history)
+        if df is not None and not df.empty:
+            print(f"> got {len(df)} rows from yfinance")
     except Exception as e:
         print(f"> yfinance failed: {e}")
+        df = None
+
+    # nsepython fallback
+    if df is None or df.empty:
+        print("> falling back to nsepython...")
+        try:
+            df = _fetch_nse(symbol, days_history)
+            if df is not None and not df.empty:
+                print(f"> got {len(df)} rows from nsepython")
+        except Exception as e:
+            print(f"> nsepython failed: {e}")
+            return None
+
+    if df is None or df.empty:
         return None
 
     try:
-        required_cols = ['date', 'close', 'volume', 'high', 'low']
-        extract_cols = [c for c in required_cols if c in df.columns]
-        df_processed = df[extract_cols].copy()
-        
-        df_processed['date'] = pd.to_datetime(df_processed['date'])
-        
-        df_processed['close'] = pd.to_numeric(df_processed['close'], errors='coerce')
-        df_processed.dropna(subset=['close'], inplace=True)
-        
-        df_processed = df_processed.sort_values('date').reset_index(drop=True)
-
-        # compute technical indicators
-        df_processed['SMA_5'] = ta.trend.sma_indicator(df_processed['close'], window=5)
-        df_processed['SMA_20'] = ta.trend.sma_indicator(df_processed['close'], window=20)
-        df_processed['RSI_14'] = ta.momentum.rsi(df_processed['close'], window=14)
-        df_processed['Volatility'] = df_processed['close'].rolling(window=14).std()
-        
-        if 'volume' not in df_processed.columns:
-            df_processed['volume'] = 0
-            
-        df_processed.dropna(inplace=True)
-        df_processed = df_processed.reset_index(drop=True)
-
+        df_processed = _add_indicators(df)
         print(f"> processed {len(df_processed)} records")
         return df_processed
-
     except Exception as e:
         print(f"> error processing data: {e}")
         return None
@@ -180,8 +232,13 @@ def generate_shap_values(model, X_train, target_instance, feature_columns):
             shap_values = shap_values[0]
 
         # sum across time steps for per-feature importance
-        feature_importance = np.sum(shap_values[0], axis=0)
-        base_value = float(np.mean(model.predict(background, verbose=0)))
+        sv = np.array(shap_values[0])
+        if sv.ndim > 1:
+            feature_importance = np.sum(sv, axis=0)
+        else:
+            feature_importance = sv
+        feature_importance = feature_importance.flatten()
+        base_value = float(np.mean(model.predict(background, verbose=0).flatten()))
 
         return {
             "features": feature_columns,
@@ -245,12 +302,6 @@ def generate_lime_weights(model, X_train, target_instance, feature_columns):
          return None
 
 
-# plotting disabled
-def plot_predictions(preds, last_date, symbol):
-    return "plot_disabled.png"
-
-
-
 # main prediction pipeline
 def get_stock_predictions(symbol: str, days_to_predict: int = 7, n_steps: int = 60, epochs: int = 15, days_history: int = 350):
     print(f"> generating prediction for {symbol}")
@@ -283,9 +334,15 @@ def get_stock_predictions(symbol: str, days_to_predict: int = 7, n_steps: int = 
         print(f"> prediction failed for {symbol}")
         return None
 
-    filename = plot_predictions(predictions_raw, last_day, symbol)
     predictions_list = [round(float(p[0]), 2) for p in predictions_raw]
     print(f"> predictions for {symbol}: {predictions_list}")
+
+    # last 30 days of historical closes for the chart
+    hist_df = df.tail(30)[['date', 'close']].copy()
+    historical_prices = [
+        {'date': row['date'].strftime('%Y-%m-%d'), 'close': round(float(row['close']), 2)}
+        for _, row in hist_df.iterrows()
+    ]
 
     # xai explanations
     target_instance = scaled_data[-n_steps:].reshape(1, n_steps, len(feature_columns))
@@ -295,7 +352,7 @@ def get_stock_predictions(symbol: str, days_to_predict: int = 7, n_steps: int = 
     return {
         'predictions': predictions_list,
         'last_date': last_day,
-        'filename': f"{filename}",
+        'historical_prices': historical_prices,
         'shap_values': shap_data,
         'lime_weights': lime_data
     }
@@ -325,7 +382,7 @@ if __name__ == "__main__":
                     print(f"  day {i}: {price:.2f}")
 
                 last_day = df['date'].max()
-                plot_predictions(predictions, last_day)
+                print(f"  last historical date: {last_day}")
             else:
                 print("> prediction failed")
         else:

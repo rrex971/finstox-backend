@@ -3,8 +3,38 @@ import os
 # os.environ["COMPLUS_Version"] = "v4.0.30319"
 
 import json
+import urllib.parse
 import nsepython as nse
 import pandas as pd
+
+# patch nsefetch to use curl (requests gets blocked by akamai)
+_nse_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+_cookie_path = '/tmp/nse_cookies.txt'
+
+def _nsefetch_curl(payload):
+    def _encode(url):
+        if '%26' in url or '%20' in url:
+            return url
+        return urllib.parse.quote(url, safe=':/?&="[]')
+    def _refresh():
+        os.popen(f'curl -s -c {_cookie_path} -H "User-Agent: {_nse_ua}" "https://www.nseindia.com"').read()
+    if not os.path.exists(_cookie_path):
+        _refresh()
+    cmd = f'curl -s -L -b {_cookie_path} -c {_cookie_path} -H "User-Agent: {_nse_ua}" "{_encode(payload)}"'
+    raw = os.popen(cmd).read()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        _refresh()
+        raw = os.popen(cmd).read()
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {}
+
+import nsepython.rahu as _rahu
+_rahu.nsefetch = _nsefetch_curl
+nse.nsefetch = _nsefetch_curl
 from fastapi import FastAPI, Depends, HTTPException
 from typing import Annotated
 from fastapi.responses import JSONResponse
@@ -573,7 +603,7 @@ async def predict_stock(symbol: str):
 
     results = get_stock_predictions(symbol, days_to_predict=7)
 
-    if results and 'predictions' in results and 'last_date' in results and 'filename' in results:
+    if results and 'predictions' in results and 'last_date' in results:
         logging.info(f"Successfully generated new prediction for {symbol}.")
 
         last_date_str = results['last_date'].strftime('%Y-%m-%d')
@@ -581,7 +611,7 @@ async def predict_stock(symbol: str):
             "symbol": symbol,
             "last_historical_date": last_date_str,
             "predicted_prices": results['predictions'],
-            "filename": results['filename'],
+            "historical_prices": results.get('historical_prices', []),
             "shap_values": results.get('shap_values'),
             "lime_weights": results.get('lime_weights')
         }
