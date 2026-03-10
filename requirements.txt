@@ -1,8 +1,15 @@
+bcrypt==4.0.1
 fastapi==0.115.12
-nsepython==2.94
+lime==0.2.0.1
+nsepython @ git+https://github.com/aeron7/nsepython.git
 pandas==2.2.3
 passlib==1.7.4
 python-dotenv==1.1.0
-python_jose==3.4.0
-Requests==2.32.3
+python-jose==3.4.0
+requests==2.32.3
+scikit-learn==1.8.0
+shap==0.51.0
+ta==0.11.0
+tensorflow==2.21.0
+uvicorn==0.41.0
 yfinance==0.2.55
