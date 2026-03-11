@@ -602,8 +602,9 @@ def _parse_index_stocks(data, limit=10):
         return stocks
     for item in data['data'][1:limit+1]:  # skip first row (index itself)
         try:
+            meta = item.get("meta", {})
             stocks.append({
-                "name": item.get("identifier", item.get("symbol", "")),
+                "name": meta.get("companyName", item.get("symbol", "")),
                 "symbol": item["symbol"],
                 "price": item["lastPrice"],
                 "onedaychange": round(abs(float(item["change"])), 2),
@@ -637,8 +638,9 @@ async def getMostActive():
     stocks = []
     for item in data['data'][1:]:  # skip index row
         try:
+            meta = item.get("meta", {})
             stocks.append({
-                "name": item.get("identifier", item.get("symbol", "")),
+                "name": meta.get("companyName", item.get("symbol", "")),
                 "symbol": item["symbol"],
                 "price": item["lastPrice"],
                 "onedaychange": round(abs(float(item["change"])), 2),
